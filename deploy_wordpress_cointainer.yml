@@ -58,3 +58,7 @@
         - { ip: '10.24.20.121' }
         - { ip: '10.24.20.122' }
         - { ip: '10.24.20.123' } 
+
+
+#wachtwoord is wel zichtbaar
+#En commado voor invintory niet heel netjes ansible-playbook -i inventory.ini deploy_wordpress_cointainer.yml
