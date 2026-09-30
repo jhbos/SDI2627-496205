@@ -1,0 +1,69 @@
+---
+- name: Configureer firewall voor WordPress containers
+  hosts: wordpress_containers
+  gather_facts: false
+  connection: local
+
+  vars_files:
+    - vault.yml
+
+  tasks:
+    - name: Pas firewallregels toe op container
+      community.proxmox.proxmox_firewall:
+        api_host: "{{ hostvars[groups['proxmox'][0]]['ansible_host'] }}"
+        api_user: "root@pam"
+        api_token_id: "{{ vault_proxmox_token_id }}"
+        api_token_secret: "{{ vault_proxmox_token_secret }}"
+        validate_certs: false
+
+        level: vm
+        vmid: "{{ proxmox_vmid }}"
+        state: present
+        update: true
+
+        rules:
+          - pos: 1
+            type: in
+            action: ACCEPT
+            source: "10.24.20.0/24"
+            proto: tcp
+            dport: "22"
+            enable: true
+            comment: "SSH vanaf managementnetwerk"
+
+          - pos: 2
+            type: in
+            action: ACCEPT
+            proto: tcp
+            dport: "80,443"
+            enable: true
+            comment: "WordPress HTTP en HTTPS"
+
+          - pos: 3
+            type: out
+            action: ACCEPT
+            proto: udp
+            dport: "53"
+            enable: true
+            comment: "DNS"
+
+          - pos: 4
+            type: out
+            action: ACCEPT
+            proto: tcp
+            dport: "53"
+            enable: true
+            comment: "DNS over TCP"
+
+          - pos: 5
+            type: out
+            action: ACCEPT
+            proto: tcp
+            dport: "80,443"
+            enable: true
+            comment: "Updates en externe WordPressdiensten"
+
+      delegate_to: localhost
+
+
+      # met secret token
