@@ -1,0 +1,66 @@
+---
+- name: Maak gebruikers en SSH-sleutels aan
+  hosts: wordpress_containers
+  gather_facts: false
+  become: true
+
+  vars:
+    wordpress_users:
+      - name: wpadmin1
+        key_path: "/root/.ssh/wpadmin1_ed25519"
+
+      - name: wpadmin2
+        key_path: "/root/.ssh/wpadmin2_ed25519"
+
+  pre_tasks:
+    - name: Controleer of de SSH-map bestaat op de Ansible-machine
+      ansible.builtin.file:
+        path: "/root/.ssh"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      become: true
+      run_once: true
+
+    - name: Genereer unieke SSH-sleutel per gebruiker
+      community.crypto.openssh_keypair:
+        path: "{{ item.key_path }}"
+        type: ed25519
+        state: present
+        mode: "0600"
+      loop: "{{ wordpress_users }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: localhost
+      become: true
+      run_once: true
+
+  tasks:
+    - name: Maak gebruikers aan
+      ansible.builtin.user:
+        name: "{{ item.name }}"
+        shell: /bin/bash
+        create_home: true
+        groups: sudo
+        append: true
+        password_lock: true
+        state: present
+      loop: "{{ wordpress_users }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Plaats de public key op de WordPress-container
+      ansible.posix.authorized_key:
+        user: "{{ item.name }}"
+        key: "{{ lookup('file', item.key_path + '.pub') }}"
+        state: present
+        manage_dir: true
+      loop: "{{ wordpress_users }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Schakel wachtwoordlogin uit
+      ansible.builtin.user:
+        name: "{{ item.name }}"
+        password_lock: true
+      loop: "{{ wordpress_users }}"
