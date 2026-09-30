@@ -1,0 +1,11 @@
+# Prometheus bestand om node-exports te zien
+scrape_configs:
+  - job_name: "servers"
+    static_configs:
+      - targets:
+          - "10.24.20.2:9100"
+          - "10.24.20.3:9100"
+          - "10.24.20.4:9100"
+
+
+# oud bestand
