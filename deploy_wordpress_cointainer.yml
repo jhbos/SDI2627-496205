@@ -2,9 +2,18 @@
 # =======================================================
 # FASE 1: Containers aanmaken en starten op Proxmox
 # =======================================================
+
 - name: Uitrollen van LXC Containers op Proxmox
   hosts: proxmox
   gather_facts: false
+
+  vars:
+    wordpress_containers:
+      - { vmid: 120, name: 'wp-site-1', ip: '10.24.20.120' }
+      - { vmid: 121, name: 'wp-site-2', ip: '10.24.20.121' }
+      - { vmid: 122, name: 'wp-site-3', ip: '10.24.20.122' }
+      - { vmid: 123, name: 'wp-site-4', ip: '10.24.20.123' }
+
   tasks:
     - name: Maak de LXC containers aan op Proxmox
       community.proxmox.proxmox:
@@ -19,6 +28,7 @@
         cores: 2
         memory: 2048
         disk: "vm-pool:16"
+        password: "Wordpress!123"
         unprivileged: true
         features:
           - nesting=1
@@ -26,11 +36,7 @@
           net0: "name=eth0,bridge=vmbr0,ip={{ item.ip }}/24,gw=10.24.20.1"
         pubkey: "{{ lookup('file', '/root/.ssh/Ansible_VM.pub') }}"
         state: present
-      loop:
-        - { vmid: 120, name: 'wp-site-1', ip: '10.24.20.120' }
-        - { vmid: 121, name: 'wp-site-2', ip: '10.24.20.121' }
-        - { vmid: 122, name: 'wp-site-3', ip: '10.24.20.122' }
-        - { vmid: 123, name: 'wp-site-4', ip: '10.24.20.123' }
+      loop: "{{ wordpress_containers }}"
 
     - name: Start de containers
       community.proxmox.proxmox:
@@ -41,24 +47,27 @@
         node: "Vm1"
         vmid: "{{ item.vmid }}"
         state: started
-      loop:
-        - { vmid: 120 }
-        - { vmid: 121 }
-        - { vmid: 122 }
-        - { vmid: 123 }
+        timeout: 300
+      loop: "{{ wordpress_containers }}"
 
-    - name: Wacht totdat SSH actief is op alle 4 de nieuwe containers
-      wait_for:
+    - name: Wacht totdat SSH actief is op alle containers
+      ansible.builtin.wait_for:
         host: "{{ item.ip }}"
         port: 22
         state: started
-        timeout: 60
-      loop:
-        - { ip: '10.24.20.120' }
-        - { ip: '10.24.20.121' }
-        - { ip: '10.24.20.122' }
-        - { ip: '10.24.20.123' } 
+        timeout: 180
+      loop: "{{ wordpress_containers }}"
 
-
-#wachtwoord is wel zichtbaar
-#En commado voor invintory niet heel netjes ansible-playbook -i inventory.ini deploy_wordpress_cointainer.yml
+    - name: Voeg containers dynamisch toe aan de inventory
+      ansible.builtin.blockinfile:
+        path: "{{ playbook_dir }}/inventory.ini"
+        create: true
+        insertafter: '^\[wordpress_containers\]$'
+        marker: "# {mark} ANSIBLE WORDPRESS CONTAINERS"
+        block: |
+          {% for container in wordpress_containers %}
+          {{ container.name }} ansible_host={{ container.ip }} proxmox_vmid={{ container.vmid }}
+          {% endfor %}
+      delegate_to: localhost
+      become: false
+      run_once: true
