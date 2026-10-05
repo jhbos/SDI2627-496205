@@ -1,0 +1,201 @@
+---
+# Maakt drie Debian cloud-init VM's voor onafhankelijke Twenty CRM-installaties.
+#
+# VMID 130 -> 10.24.20.30
+# VMID 131 -> 10.24.20.31
+# VMID 132 -> 10.24.20.32
+#
+# Vereist:
+# - Proxmox-node: S1
+# - Storage: Vmpool
+# - Storage local met snippets-functionaliteit
+# - Public key: /root/.ssh/Ansible_VM.pub
+
+- name: Maak Twenty CRM VM's op Proxmox
+  hosts: proxmox
+  gather_facts: false
+
+  vars:
+    twenty_image_url: "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+    twenty_image_path: "/var/lib/vz/template/iso/debian-13-genericcloud-amd64.qcow2"
+
+    twenty_vms:
+      - vmid: 130
+        name: twenty-crm-1
+        ip: 10.24.20.30
+
+      - vmid: 131
+        name: twenty-crm-2
+        ip: 10.24.20.31
+
+      - vmid: 132
+        name: twenty-crm-3
+        ip: 10.24.20.32
+
+  tasks:
+    - name: Controleer of de admin public key bestaat
+      ansible.builtin.stat:
+        path: /root/.ssh/Ansible_VM.pub
+      register: admin_key
+      delegate_to: localhost
+      run_once: true
+
+    - name: Stop als de admin public key ontbreekt
+      ansible.builtin.fail:
+        msg: "Plaats de public key op /root/.ssh/Ansible_VM.pub op de Ansible-server."
+      when: not admin_key.stat.exists
+      delegate_to: localhost
+      run_once: true
+
+    - name: Download Debian cloud image
+      ansible.builtin.get_url:
+        url: "{{ twenty_image_url }}"
+        dest: "{{ twenty_image_path }}"
+        mode: "0644"
+        force: false
+
+    - name: Maak cloud-init snippet directory
+      ansible.builtin.file:
+        path: /var/lib/vz/snippets
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Maak cloud-init configuratie per VM
+      ansible.builtin.template:
+        src: twenty-cloud-init.yaml.j2
+        dest: "/var/lib/vz/snippets/twenty-{{ item.vmid }}-user.yaml"
+        owner: root
+        group: root
+        mode: "0600"
+      loop: "{{ twenty_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Controleer of de VM al bestaat
+      ansible.builtin.command:
+        cmd: "qm status {{ item.vmid }}"
+      register: vm_status
+      loop: "{{ twenty_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+      failed_when: false
+
+    - name: Maak ontbrekende VM's aan
+      ansible.builtin.command:
+        cmd: >-
+          qm create {{ item.item.vmid }}
+          --name {{ item.item.name }}
+          --memory 2048
+          --cores 2
+          --scsihw virtio-scsi-pci
+          --net0 virtio,bridge=vmbr0,firewall=1
+          --agent enabled=1
+      loop: "{{ vm_status.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.rc != 0
+
+    - name: Importeer de Debian disk in Vmpool
+      ansible.builtin.command:
+        cmd: >-
+          qm importdisk {{ item.item.vmid }}
+          {{ twenty_image_path }}
+          Vmpool
+          --format qcow2
+      loop: "{{ vm_status.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: item.rc != 0
+
+    - name: Controleer de huidige VM-configuratie
+      ansible.builtin.command:
+        cmd: "qm config {{ item.vmid }}"
+      register: current_vm_config
+      loop: "{{ twenty_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
+    - name: Configureer disks, cloud-init en netwerk
+      ansible.builtin.command:
+        cmd: >-
+          qm set {{ item.vmid }}
+          --scsi0 Vmpool:vm-{{ item.vmid }}-disk-0
+          --boot order=scsi0
+          --ide2 Vmpool:cloudinit
+          --cicustom user=local:snippets/twenty-{{ item.vmid }}-user.yaml
+          --ipconfig0 ip={{ item.ip }}/24,gw=10.24.20.1
+          --serial0 socket
+          --vga serial0
+      loop: "{{ twenty_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Controleer de huidige diskconfiguratie
+      ansible.builtin.command:
+        cmd: "qm config {{ item.vmid }}"
+      register: vm_config
+      loop: "{{ twenty_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: false
+
+    - name: Vergroot de VM-disk naar 50 GB
+      ansible.builtin.command:
+        cmd: "qm resize {{ item.item.vmid }} scsi0 50G"
+      loop: "{{ vm_config.results }}"
+      loop_control:
+        label: "{{ item.item.name }}"
+      when: "'size=50G' not in item.stdout"
+
+    - name: Configureer de VM-firewall
+      ansible.builtin.command:
+        cmd: "tee /etc/pve/firewall/{{ item.vmid }}.fw"
+        stdin: |
+          [OPTIONS]
+          enable: 1
+          policy_in: DROP
+          policy_out: ACCEPT
+
+          [RULES]
+          IN ACCEPT -p tcp -dport 22 -source 10.24.20.0/24
+          IN ACCEPT -p tcp -dport 3000 -source 10.24.20.0/24
+      loop: "{{ twenty_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+      changed_when: true
+
+    - name: Maak dagelijkse snapshot-taak op Proxmox
+      ansible.builtin.copy:
+        dest: /etc/cron.d/twenty-vm-snapshots
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          30 2 * * * root for vmid in 130 131 132; do qm status "$vmid" >/dev/null 2>&1 && qm snapshot "$vmid" "daily-$(date +\%F)" --description "Automatische dagelijkse Twenty CRM snapshot"; done
+
+    - name: Start de VM's
+      ansible.builtin.command:
+        cmd: "qm start {{ item.vmid }}"
+      loop: "{{ twenty_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+      register: start_result
+      changed_when: start_result.rc == 0
+      failed_when:
+        - start_result.rc != 0
+        - "'already running' not in (start_result.stderr | lower)"
+
+    - name: Wacht op SSH van de VM's
+      ansible.builtin.wait_for:
+        host: "{{ item.ip }}"
+        port: 22
+        state: started
+        timeout: 300
+      loop: "{{ twenty_vms }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: localhost

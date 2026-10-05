@@ -1,0 +1,25 @@
+#cloud-config
+hostname: {{ item.name }}
+manage_etc_hosts: true
+users:
+  - name: crmadmin
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    ssh_authorized_keys:
+      - {{ lookup('file', '/root/.ssh/Ansible_VM.pub') }}
+    lock_passwd: true
+package_update: true
+packages:
+  - ca-certificates
+  - curl
+  - git
+  - openssh-server
+runcmd:
+  - [ sh, -c, "curl -fsSL https://get.docker.com | sh" ]
+  - [ systemctl, enable, --now, docker ]
+  - [ usermod, -aG, docker, crmadmin ]
+  - [ mkdir, -p, /opt/twenty ]
+  - [ sh, -c, "curl -fsSL https://raw.githubusercontent.com/twentyhq/twenty/main/packages/twenty-docker/docker-compose.yml -o /opt/twenty/docker-compose.yml" ]
+  - [ sh, -c, "cd /opt/twenty && test -s docker-compose.yml" ]
+  - [ sh, -c, "cd /opt/twenty && docker compose up -d" ]
