@@ -1,0 +1,230 @@
+---
+# =======================================================
+# FASE 1: WordPress LXC-containers aanmaken
+# =======================================================
+
+- name: WordPress-containers uitrollen op Proxmox
+  hosts: proxmox
+  gather_facts: false
+
+  vars_files:
+    - vault.yml
+
+  vars:
+    wordpress_containers:
+      - vmid: 120
+        name: wp-site-1
+        ip: 10.24.20.120
+
+      - vmid: 121
+        name: wp-site-2
+        ip: 10.24.20.121
+
+      - vmid: 122
+        name: wp-site-3
+        ip: 10.24.20.122
+
+      - vmid: 123
+        name: wp-site-4
+        ip: 10.24.20.123
+
+    ssh_users:
+      - name: beheerder1
+        public_key: /root/.ssh/beheerder1.pub
+
+      - name: beheerder2
+        public_key: /root/.ssh/beheerder2.pub
+
+  tasks:
+    - name: Controleer of de root public key bestaat
+      ansible.builtin.stat:
+        path: /root/.ssh/Ansible_VM.pub
+      register: root_public_key
+      delegate_to: localhost
+      run_once: true
+
+    - name: Stop als de root public key ontbreekt
+      ansible.builtin.fail:
+        msg: "De public key /root/.ssh/Ansible_VM.pub bestaat niet op de Ansible-server."
+      when: not root_public_key.stat.exists
+      delegate_to: localhost
+      run_once: true
+
+    - name: Controleer of de extra public keys bestaan
+      ansible.builtin.stat:
+        path: "{{ item.public_key }}"
+      loop: "{{ ssh_users }}"
+      loop_control:
+        label: "{{ item.public_key }}"
+      register: extra_public_keys
+      delegate_to: localhost
+      run_once: true
+
+    - name: Stop als een extra public key ontbreekt
+      ansible.builtin.fail:
+        msg: "De public key {{ item.item.public_key }} bestaat niet op de Ansible-server."
+      loop: "{{ extra_public_keys.results }}"
+      loop_control:
+        label: "{{ item.item.public_key }}"
+      when: not item.stat.exists
+      delegate_to: localhost
+      run_once: true
+
+    - name: Maak de LXC-containers aan
+      community.proxmox.proxmox:
+        api_host: "{{ ansible_host }}"
+        validate_certs: false
+        api_user: "root@pam"
+        api_token_id: "{{ vault_proxmox_token_id }}"
+        api_token_secret: "{{ vault_proxmox_token_secret }}"
+        node: "S1"
+        vmid: "{{ item.vmid }}"
+        hostname: "{{ item.name }}"
+        ostemplate: "local:vztmpl/debian-12-turnkey-wordpress_18.2-1_amd64.tar.gz"
+        cores: 2
+        memory: 2048
+        disk: "Vmpool:16"
+        password: "WP123!"
+        unprivileged: true
+        features:
+          - nesting=1
+        netif:
+          net0: "name=eth0,bridge=vmbr0,ip={{ item.ip }}/24,gw=10.24.20.1,firewall=1"
+        pubkey: "{{ lookup('file', '/root/.ssh/Ansible_VM.pub') }}"
+        state: present
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Start de containers
+      community.proxmox.proxmox:
+        api_host: "{{ ansible_host }}"
+        validate_certs: false
+        api_user: "root@pam"
+        api_token_id: "{{ vault_proxmox_token_id }}"
+        api_token_secret: "{{ vault_proxmox_token_secret }}"
+        node: "S1"
+        vmid: "{{ item.vmid }}"
+        state: started
+        timeout: 300
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Verwijder oude SSH-hostkeys
+      ansible.builtin.command:
+        cmd: "ssh-keygen -f /root/.ssh/known_hosts -R {{ item.ip }}"
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.ip }}"
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+
+    - name: Wacht totdat SSH actief is
+      ansible.builtin.wait_for:
+        host: "{{ item.ip }}"
+        port: 22
+        state: started
+        timeout: 180
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Voeg nieuwe SSH-hostkeys toe
+      ansible.builtin.known_hosts:
+        name: "{{ item.ip }}"
+        key: "{{ lookup('pipe', 'ssh-keyscan -T 10 -H -t ed25519 ' ~ item.ip) }}"
+        path: /root/.ssh/known_hosts
+        state: present
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.ip }}"
+      delegate_to: localhost
+
+    - name: Werk de inventory bij
+      ansible.builtin.blockinfile:
+        path: "{{ playbook_dir }}/inventory.ini"
+        create: true
+        insertafter: '^\[wordpress_containers\]$'
+        marker: "# {mark} ANSIBLE WORDPRESS CONTAINERS"
+        block: |
+          {% for container in wordpress_containers %}
+          {{ container.name }} ansible_host={{ container.ip }} ansible_user=root ansible_ssh_private_key_file=/root/.ssh/Ansible_VM proxmox_vmid={{ container.vmid }}
+          {% endfor %}
+      delegate_to: localhost
+      run_once: true
+
+    - name: Installeer sudo in de containers
+      ansible.builtin.apt:
+        name: sudo
+        state: present
+        update_cache: true
+      delegate_to: "{{ item.name }}"
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Maak de sudo-groep aan
+      ansible.builtin.group:
+        name: sudo
+        state: present
+      delegate_to: "{{ item.name }}"
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Maak de extra SSH-gebruikers aan
+      ansible.builtin.user:
+        name: "{{ user.name }}"
+        shell: /bin/bash
+        create_home: true
+        groups:
+          - sudo
+        append: true
+        state: present
+      vars:
+        user: "{{ account }}"
+      loop: "{{ wordpress_containers | product(ssh_users) | list }}"
+      loop_control:
+        label: "{{ item.0.name }} - {{ item.1.name }}"
+      delegate_to: "{{ item.0.name }}"
+      when: false
+
+    - name: Maak beheerder1 en beheerder2 aan
+      ansible.builtin.user:
+        name: "{{ item.1.name }}"
+        shell: /bin/bash
+        create_home: true
+        groups:
+          - sudo
+        append: true
+        state: present
+      loop: "{{ wordpress_containers | product(ssh_users) | list }}"
+      loop_control:
+        label: "{{ item.0.name }} - {{ item.1.name }}"
+      delegate_to: "{{ item.0.name }}"
+
+    - name: Voeg de persoonlijke SSH-keys toe
+      ansible.posix.authorized_key:
+        user: "{{ item.1.name }}"
+        key: "{{ lookup('file', item.1.public_key) }}"
+        state: present
+        manage_dir: true
+      loop: "{{ wordpress_containers | product(ssh_users) | list }}"
+      loop_control:
+        label: "{{ item.0.name }} - {{ item.1.name }}"
+      delegate_to: "{{ item.0.name }}"
+
+    - name: Sta passwordless sudo toe aan de beheerders
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/{{ item.1.name }}"
+        content: "{{ item.1.name }} ALL=(ALL) NOPASSWD: ALL\n"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: "/usr/sbin/visudo -cf %s"
+      loop: "{{ wordpress_containers | product(ssh_users) | list }}"
+      loop_control:
+        label: "{{ item.0.name }} - {{ item.1.name }}"
+      delegate_to: "{{ item.0.name }}"

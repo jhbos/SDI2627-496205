@@ -1,0 +1,37 @@
+---
+# Niet-geheime configuratie voor worpresmetshhkey.
+# Geheimen, zoals Proxmox API-tokens, horen in vault.yml.
+
+proxmox_ostemplate: "local:vztmpl/debian-13-standard_13.6-1_amd64.tar.zst"
+
+wordpress_download_url: "https://wordpress.org/latest.tar.gz"
+wordpress_web_root: "/var/www/html"
+wordpress_server_name: "_"
+wordpress_php_fpm_service: "php8.4-fpm"
+wordpress_php_socket: "/run/php/php8.4-fpm.sock"
+wordpress_database_name: "wordpress"
+wordpress_database_user: "wordpress"
+
+wordpress_containers:
+  - vmid: 120
+    name: wp-site-1
+    ip: 10.24.20.120
+
+  - vmid: 121
+    name: wp-site-2
+    ip: 10.24.20.121
+
+  - vmid: 122
+    name: wp-site-3
+    ip: 10.24.20.122
+
+  - vmid: 123
+    name: wp-site-4
+    ip: 10.24.20.123
+
+ssh_users:
+  - name: beheerder1
+    public_key: /root/.ssh/beheerder1.pub
+
+  - name: beheerder2
+    public_key: /root/.ssh/beheerder2.pub

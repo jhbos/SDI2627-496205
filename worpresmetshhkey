@@ -1,0 +1,444 @@
+---
+# =======================================================
+# FASE 1: WordPress LXC-containers aanmaken
+# =======================================================
+
+- name: WordPress-containers uitrollen op Proxmox
+  hosts: proxmox
+  gather_facts: false
+
+  vars_files:
+    - vars.yml
+    - vault.yml
+
+  tasks:
+    - name: Controleer of de root public key bestaat
+      ansible.builtin.stat:
+        path: /root/.ssh/Ansible_VM.pub
+      register: root_public_key
+      delegate_to: localhost
+      run_once: true
+
+    - name: Stop als de root public key ontbreekt
+      ansible.builtin.fail:
+        msg: "De public key /root/.ssh/Ansible_VM.pub bestaat niet op de Ansible-server."
+      when: not root_public_key.stat.exists
+      delegate_to: localhost
+      run_once: true
+
+    - name: Controleer of de extra public keys bestaan
+      ansible.builtin.stat:
+        path: "{{ item.public_key }}"
+      loop: "{{ ssh_users }}"
+      loop_control:
+        label: "{{ item.public_key }}"
+      register: extra_public_keys
+      delegate_to: localhost
+      run_once: true
+
+    - name: Stop als een extra public key ontbreekt
+      ansible.builtin.fail:
+        msg: "De public key {{ item.item.public_key }} bestaat niet op de Ansible-server."
+      loop: "{{ extra_public_keys.results }}"
+      loop_control:
+        label: "{{ item.item.public_key }}"
+      when: not item.stat.exists
+      delegate_to: localhost
+      run_once: true
+
+    - name: Maak de LXC-containers aan
+      community.proxmox.proxmox:
+        api_host: "{{ ansible_host }}"
+        validate_certs: false
+        api_user: "root@pam"
+        api_token_id: "{{ vault_proxmox_token_id }}"
+        api_token_secret: "{{ vault_proxmox_token_secret }}"
+        node: "S1"
+        vmid: "{{ item.vmid }}"
+        hostname: "{{ item.name }}"
+        ostemplate: "{{ proxmox_ostemplate }}"
+        cores: 2
+        memory: 2048
+        disk: "Vmpool:16"
+        password: "WP123!"
+        unprivileged: true
+        features:
+          - nesting=1
+        netif:
+          net0: "name=eth0,bridge=vmbr0,ip={{ item.ip }}/24,gw=10.24.20.1,firewall=1"
+        pubkey: "{{ lookup('file', '/root/.ssh/Ansible_VM.pub') }}"
+        state: present
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Start de containers
+      community.proxmox.proxmox:
+        api_host: "{{ ansible_host }}"
+        validate_certs: false
+        api_user: "root@pam"
+        api_token_id: "{{ vault_proxmox_token_id }}"
+        api_token_secret: "{{ vault_proxmox_token_secret }}"
+        node: "S1"
+        vmid: "{{ item.vmid }}"
+        state: started
+        timeout: 300
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Verwijder oude SSH-hostkeys
+      ansible.builtin.command:
+        cmd: "ssh-keygen -f /root/.ssh/known_hosts -R {{ item.ip }}"
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.ip }}"
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+
+    - name: Wacht totdat SSH actief is
+      ansible.builtin.wait_for:
+        host: "{{ item.ip }}"
+        port: 22
+        state: started
+        timeout: 180
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Voeg nieuwe SSH-hostkeys toe
+      ansible.builtin.known_hosts:
+        name: "{{ item.ip }}"
+        key: "{{ lookup('pipe', 'ssh-keyscan -T 10 -H ' ~ item.ip) }}"
+        path: /root/.ssh/known_hosts
+        state: present
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.ip }}"
+      delegate_to: localhost
+
+    - name: Werk de inventory bij
+      ansible.builtin.blockinfile:
+        path: "{{ playbook_dir }}/inventory.ini"
+        create: true
+        insertafter: '^\[wordpress_containers\]$'
+        marker: "# {mark} ANSIBLE WORDPRESS CONTAINERS"
+        block: |
+          {% for container in wordpress_containers %}
+          {{ container.name }} ansible_host={{ container.ip }} ansible_user=root ansible_ssh_private_key_file=/root/.ssh/Ansible_VM proxmox_vmid={{ container.vmid }}
+          {% endfor %}
+      delegate_to: localhost
+      run_once: true
+
+    - name: Installeer sudo in de containers
+      ansible.builtin.apt:
+        name: sudo
+        state: present
+        update_cache: true
+      delegate_to: "{{ item.name }}"
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Maak de sudo-groep aan
+      ansible.builtin.group:
+        name: sudo
+        state: present
+      delegate_to: "{{ item.name }}"
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+
+    - name: Maak de extra SSH-gebruikers aan
+      ansible.builtin.user:
+        name: "{{ user.name }}"
+        shell: /bin/bash
+        create_home: true
+        groups:
+          - sudo
+        append: true
+        state: present
+      vars:
+        user: "{{ account }}"
+      loop: "{{ wordpress_containers | product(ssh_users) | list }}"
+      loop_control:
+        label: "{{ item.0.name }} - {{ item.1.name }}"
+      delegate_to: "{{ item.0.name }}"
+      when: false
+
+    - name: Maak beheerder1 en beheerder2 aan
+      ansible.builtin.user:
+        name: "{{ item.1.name }}"
+        shell: /bin/bash
+        create_home: true
+        groups:
+          - sudo
+        append: true
+        state: present
+      loop: "{{ wordpress_containers | product(ssh_users) | list }}"
+      loop_control:
+        label: "{{ item.0.name }} - {{ item.1.name }}"
+      delegate_to: "{{ item.0.name }}"
+
+    - name: Voeg de persoonlijke SSH-keys toe
+      ansible.posix.authorized_key:
+        user: "{{ item.1.name }}"
+        key: "{{ lookup('file', item.1.public_key) }}"
+        state: present
+        manage_dir: true
+      loop: "{{ wordpress_containers | product(ssh_users) | list }}"
+      loop_control:
+        label: "{{ item.0.name }} - {{ item.1.name }}"
+      delegate_to: "{{ item.0.name }}"
+
+    - name: Sta passwordless sudo toe aan de beheerders
+      ansible.builtin.copy:
+        dest: "/etc/sudoers.d/{{ item.1.name }}"
+        content: "{{ item.1.name }} ALL=(ALL) NOPASSWD: ALL\n"
+        owner: root
+        group: root
+        mode: "0440"
+        validate: "/usr/sbin/visudo -cf %s"
+      loop: "{{ wordpress_containers | product(ssh_users) | list }}"
+      loop_control:
+        label: "{{ item.0.name }} - {{ item.1.name }}"
+      delegate_to: "{{ item.0.name }}"
+
+    - name: Installeer Nginx, PHP, MariaDB en vereiste extensies
+      ansible.builtin.apt:
+        name:
+          - nginx
+          - mariadb-server
+          - php-fpm
+          - php-mysql
+          - php-curl
+          - php-gd
+          - php-intl
+          - php-mbstring
+          - php-xml
+          - php-zip
+          - python3-pymysql
+          - tar
+          - curl
+        state: present
+        update_cache: true
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: "{{ item.name }}"
+
+    - name: Start de webserver-, PHP- en databaseservices
+      ansible.builtin.service:
+        name: "{{ item.1 }}"
+        state: started
+        enabled: true
+      loop: "{{ wordpress_containers | product(['nginx', 'mariadb', wordpress_php_fpm_service]) | list }}"
+      loop_control:
+        label: "{{ item.0.name }} - {{ item.1 }}"
+      delegate_to: "{{ item.0.name }}"
+
+    - name: Maak de WordPress-database aan
+      community.mysql.mysql_db:
+        name: "{{ wordpress_database_name }}"
+        state: present
+        login_unix_socket: /run/mysqld/mysqld.sock
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: "{{ item.name }}"
+
+    - name: Maak de WordPress-databasegebruiker aan
+      community.mysql.mysql_user:
+        name: "{{ wordpress_database_user }}"
+        password: "{{ vault_wordpress_database_password }}"
+        priv: "{{ wordpress_database_name }}.*:ALL"
+        host: localhost
+        state: present
+        login_unix_socket: /run/mysqld/mysqld.sock
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: "{{ item.name }}"
+      no_log: true
+
+    - name: Download WordPress
+      ansible.builtin.get_url:
+        url: "{{ wordpress_download_url }}"
+        dest: /tmp/wordpress.tar.gz
+        mode: "0644"
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: "{{ item.name }}"
+
+    - name: Pak WordPress uit
+      ansible.builtin.unarchive:
+        src: /tmp/wordpress.tar.gz
+        dest: /tmp
+        remote_src: true
+        creates: /tmp/wordpress/wp-settings.php
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: "{{ item.name }}"
+
+    - name: Installeer WordPress-bestanden
+      ansible.builtin.copy:
+        src: /tmp/wordpress/
+        dest: "{{ wordpress_web_root }}/"
+        remote_src: true
+        owner: www-data
+        group: www-data
+        mode: "0644"
+        directory_mode: "0755"
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: "{{ item.name }}"
+
+    - name: Maak de WordPress-webroot toegankelijk voor Nginx
+      ansible.builtin.file:
+        path: "{{ item.1 }}"
+        state: directory
+        owner: "{{ 'www-data' if item.1 == wordpress_web_root else 'root' }}"
+        group: "{{ 'www-data' if item.1 == wordpress_web_root else 'root' }}"
+        mode: "0755"
+      loop: "{{ wordpress_containers | product(['/var/www', wordpress_web_root]) | list }}"
+      loop_control:
+        label: "{{ item.0.name }} - {{ item.1 }}"
+      delegate_to: "{{ item.0.name }}"
+
+    - name: Geef WordPress-mappen lees- en uitvoerrechten
+      ansible.builtin.command:
+        cmd: "find {{ wordpress_web_root }} -type d -exec chmod 0755 {} +"
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: "{{ item.name }}"
+      changed_when: true
+
+    - name: Geef WordPress-bestanden leesrechten
+      ansible.builtin.command:
+        cmd: "find {{ wordpress_web_root }} -type f -exec chmod 0644 {} +"
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: "{{ item.name }}"
+      changed_when: true
+
+    - name: Zet eigenaar van WordPress-bestanden en mappen
+      ansible.builtin.file:
+        path: "{{ wordpress_web_root }}"
+        owner: www-data
+        group: www-data
+        recurse: true
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: "{{ item.name }}"
+
+    - name: Maak WordPress-configuratie aan
+      ansible.builtin.copy:
+        dest: "{{ wordpress_web_root }}/wp-config.php"
+        owner: www-data
+        group: www-data
+        mode: "0640"
+        content: |
+          <?php
+          define('DB_NAME', '{{ wordpress_database_name }}');
+          define('DB_USER', '{{ wordpress_database_user }}');
+          define('DB_PASSWORD', '{{ vault_wordpress_database_password }}');
+          define('DB_HOST', 'localhost');
+          define('DB_CHARSET', 'utf8mb4');
+          define('DB_COLLATE', '');
+
+          define('AUTH_KEY',         '{{ vault_wordpress_auth_key }}');
+          define('SECURE_AUTH_KEY',  '{{ vault_wordpress_secure_auth_key }}');
+          define('LOGGED_IN_KEY',    '{{ vault_wordpress_logged_in_key }}');
+          define('NONCE_KEY',        '{{ vault_wordpress_nonce_key }}');
+          define('AUTH_SALT',        '{{ vault_wordpress_auth_salt }}');
+          define('SECURE_AUTH_SALT', '{{ vault_wordpress_secure_auth_salt }}');
+          define('LOGGED_IN_SALT',   '{{ vault_wordpress_logged_in_salt }}');
+          define('NONCE_SALT',       '{{ vault_wordpress_nonce_salt }}');
+
+          $table_prefix = 'wp_';
+          define('WP_DEBUG', false);
+          if (!defined('ABSPATH')) {
+              define('ABSPATH', __DIR__ . '/');
+          }
+          require_once ABSPATH . 'wp-settings.php';
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: "{{ item.name }}"
+      no_log: true
+
+    - name: Configureer Nginx voor WordPress
+      ansible.builtin.copy:
+        dest: /etc/nginx/sites-available/wordpress
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+              server_name {{ wordpress_server_name }};
+              root {{ wordpress_web_root }};
+              index index.php index.html;
+
+              location / {
+                  try_files $uri $uri/ /index.php?$args;
+              }
+
+              location ~ \.php$ {
+                  include snippets/fastcgi-php.conf;
+                  fastcgi_pass unix:{{ wordpress_php_socket }};
+              }
+
+              location ~ /\. {
+                  deny all;
+              }
+          }
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: "{{ item.name }}"
+
+    - name: Activeer de WordPress-Nginx-site
+      ansible.builtin.file:
+        src: /etc/nginx/sites-available/wordpress
+        dest: /etc/nginx/sites-enabled/wordpress
+        state: link
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: "{{ item.name }}"
+
+    - name: Verwijder de standaard-Nginx-site
+      ansible.builtin.file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: "{{ item.name }}"
+
+    - name: Controleer Nginx-configuratie
+      ansible.builtin.command:
+        cmd: nginx -t
+      changed_when: false
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: "{{ item.name }}"
+
+    - name: Herstart Nginx in de containers
+      ansible.builtin.service:
+        name: nginx
+        state: restarted
+      loop: "{{ wordpress_containers }}"
+      loop_control:
+        label: "{{ item.name }}"
+      delegate_to: "{{ item.name }}"
